@@ -10,10 +10,12 @@ locally
 2. Run a Datomic transactor
 2. Install the Datomic schema: `lein run -m install-schema _datomic_uri_`
 
-## Getting Started
+## See it work
 
 1. Start the application: `lein run-dev` \*
-2. Open index.html from your clone of the Todo Backend JS Spec repo.
+2. Open
+   [the specs](http://www.todobackend.com/specs/index.html?http://localhost:8080/)
+   to see test results.
 3. Enter [localhost:8080](http://localhost:8080/) as the base URL
 
 \* `lein run-dev` automatically detects code changes. Alternatively, you can run in production mode
