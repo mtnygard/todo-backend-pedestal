@@ -3,15 +3,13 @@
             [clojure.java.io :as io]
             [clojure.walk :as walk]
             [datomic.api :as d]
-            [environ.core :as env]
             [io.pedestal.http :as bootstrap]
             [io.pedestal.http.body-params :as body-params]
             [io.pedestal.http.route :as route]
             [io.pedestal.http.route.definition :as definition]
             [io.pedestal.interceptor :as interceptor]
-            [ring.util.response :as ring-resp]))
-
-(defonce uri (env/env :datomic-uri (str "datomic:mem://" (d/squuid))))
+            [ring.util.response :as ring-resp]
+            [io.pedestal.interceptor.helpers :as helpers]))
 
 (def schema [{:db/id                 #db/id[:db.part/db]
               :db/ident              :todo/title
@@ -33,19 +31,19 @@
               :db.install/_attribute :db.part/db}])
 
 (defn ensure-schema
-  []
+  [uri]
   (d/create-database uri)
   @(d/transact (d/connect uri) schema))
 
-(def insert-datomic
+(defn insert-datomic
+  [conn]
   "Provide a Datomic conn and db in all incoming requests"
   (interceptor/interceptor
    {:name ::insert-datomic
     :enter (fn [context]
-             (let [conn (d/connect uri)]
-               (-> context
-                   (assoc-in [:request :conn] conn)
-                   (assoc-in [:request :db] (d/db conn)))))}))
+             (-> context
+                 (assoc-in [:request :conn] conn)
+                 (assoc-in [:request :db] (d/db conn))))}))
 
 (defn resolve-id
   [tid tx-result]
@@ -93,12 +91,12 @@
     (ring-resp/response (canonicalize (jsonify e)))
     (ring-resp/not-found [])))
 
-(defn todo-show
+(helpers/defhandler todo-show
   [{db :db {:keys [id]} :path-params :as req}]
   (let [id (if (string? id) (edn/read-string id) id)]
     (respond-with-item db id)))
 
-(defn todo-list
+(helpers/defhandler todo-list
   [{:keys [db]}]
   (ring-resp/response
    (map canonicalize
@@ -109,71 +107,61 @@
                                  :where [?id :todo/title]]
                                db)))))))
 
-(defn todo-create
-  [{conn :conn {:keys [title order]} :json-params :as req}]
-  (let [datoms    (make-todo-datoms nil title false (if (string? order) (edn/read-string order) order))
-        id        (second (first datoms))
-        tx-result @(d/transact conn datoms)
-        new-id    (d/resolve-tempid (:db-after tx-result) (:tempids tx-result) id)]
-    (respond-with-item (:db-after tx-result) new-id)))
+(helpers/defbefore todo-create
+  [context]
+  (let [req                   (:request context)
+        {:keys [title order]} (:json-params req)
+        datoms                (make-todo-datoms nil title false (if (string? order) (edn/read-string order) order))
+        id                    (second (first datoms))
+        tx-result             @(d/transact (:conn req) datoms)
+        new-id                (d/resolve-tempid (:db-after tx-result) (:tempids tx-result) id)]
+    (-> context
+        (assoc-in [:request :path-params :id] new-id)
+        (assoc-in [:request :db] (:db-after tx-result)))))
 
-(defn todo-delete
+(helpers/defhandler todo-delete
   [{conn :conn {:keys [id]} :path-params :as req}]
   (let [id        (if (string? id) (edn/read-string id) id)
         tx-result @(d/transact conn [[:db.fn/retractEntity id]])]
     (ring-resp/response "Deleted")))
 
-(defn todo-delete-all
-  [{:keys [conn db] :as req}]
+(helpers/defbefore todo-delete-all
+  [{{:keys [conn db]} :request :as context}]
   (let [retract-all (d/q '[:find ?retract-fn ?id
                            :in $ ?retract-fn
                            :where [?id :todo/title]]
                          db :db.fn/retractEntity)
         tx-result   @(d/transact conn (into [] retract-all))]
-    (todo-list (assoc req :db (:db-after tx-result)))))
+    (assoc-in context [:request :db] (:db-after tx-result))))
 
-(defn todo-update
-  [{conn :conn {:keys [id]} :path-params {:keys [title completed order]} :json-params :as req}]
-  (let [id        (if (string? id)    (edn/read-string id)    id)
-        order     (if (string? order) (edn/read-string order) order)
-        datoms    (make-todo-datoms id title completed order)
-        tx-result @(d/transact conn datoms)]
-    (respond-with-item (:db-after tx-result) id)))
+(helpers/defbefore todo-update
+  [context]
+  (let [req                             (:request context)
+        {:keys [id]}                    (:path-params req)
+        {:keys [title completed order]} (:json-params req)
+        id                              (if (string? id)    (edn/read-string id)    id)
+        order                           (if (string? order) (edn/read-string order) order)
+        datoms                          (make-todo-datoms id title completed order)
+        tx-result                       @(d/transact (:conn req) datoms)]
+    (assoc-in context [:request :db] (:db-after tx-result))))
 
-(definition/defroutes routes
-  ;; Defines "/" and "/about" routes with their associated :get handlers.
-  ;; The interceptors defined after the verb map (e.g., {:get home-page}
-  ;; apply to / and its children (/about).
-  [[["/" {:get    todo-list
-          :post   todo-create
-          :delete todo-delete-all}
-     ^:interceptors [(body-params/body-params) insert-datomic bootstrap/json-body]
-     ["/:id" {:get    todo-show
-              :patch  todo-update
-              :delete todo-delete}]]]])
+(defn routes
+  [conn]
+  (definition/expand-routes
+    [[["/" {:get    todo-list
+            :post   [:post-todo   ^:interceptors [todo-create]     todo-show]
+            :delete [:delete-todo ^:interceptors [todo-delete-all] todo-list]}
+       ^:interceptors [(body-params/body-params) (insert-datomic conn) bootstrap/json-body]
+       ["/:id" {:get    todo-show
+                :patch  [:patch-todo ^:interceptors [todo-update] todo-show]
+                :delete todo-delete}]]]]))
 
-;; Consumed by todo-backend-pedestal.server/create-server
-;; See bootstrap/default-interceptors for additional options you can configure
-(def service {:env :prod
-              ;; You can bring your own non-default interceptors. Make
-              ;; sure you include routing and set it up right for
-              ;; dev-mode. If you do, many other keys for configuring
-              ;; default interceptors will be ignored.
-              ;; ::bootstrap/interceptors []
-              ::bootstrap/routes routes
-
-              ;; Uncomment next line to enable CORS support, add
-              ;; string(s) specifying scheme, host and port for
-              ;; allowed source(s):
-              ;;
-              ;; "http://localhost:8080"
-              ;;
-              ::bootstrap/allowed-origins ["http://www.todobackend.com"]
-
-              ;; Root for resource interceptor/interceptor that is available by default.
-              ::bootstrap/resource-path "/public"
-
-              ;; Either :jetty, :immutant or :tomcat (see comments in project.clj)
-              ::bootstrap/type :jetty
-              ;;::bootstrap/host "localhost"
-              ::bootstrap/port 8080})
+(defn service
+  [datomic-uri]
+  (let [conn (d/connect datomic-uri)]
+    {:env :prod
+     ::bootstrap/routes (routes conn)
+     ::bootstrap/allowed-origins ["http://www.todobackend.com"]
+     ::bootstrap/resource-path "/public"
+     ::bootstrap/type :jetty
+     ::bootstrap/port 8080}))
