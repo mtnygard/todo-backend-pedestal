@@ -7,7 +7,7 @@ spec using Pedestal and Datomic.
 
 1. Clone https://github.com/TodoBackend/todo-backend-js-spec.git
 locally
-2. Run a Datomic transactor
+2. [Run a Datomic transactor](http://docs.datomic.com/run-transactor.html)
 2. Install the Datomic schema: `lein run -m install-schema _datomic_uri_`
 
 ## See it work
